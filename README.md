@@ -1,4 +1,4 @@
-# Driftwatch
+<h1 align="center">Driftwatch</h1>
 
 <p align="center">
   <img src="https://res.cloudinary.com/dcu6gtw2y/image/upload/v1776836809/Blog%20Pictures/logo-primary_aoypls.svg" width="120" alt="Driftwatch">
