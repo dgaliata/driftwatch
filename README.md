@@ -1,5 +1,9 @@
 # Driftwatch
 
+<p align="center">
+  <img src="https://res.cloudinary.com/dcu6gtw2y/image/upload/v1776836809/Blog%20Pictures/logo-primary_aoypls.svg" width="120" alt="Driftwatch">
+</p>
+
 Driftwatch is an open source tool for catching infrastructure drift between your live AWS environment and your Terraform code.
 
 It solves a specific problem: before you run `terraform apply`, do you actually know what's already sitting in your AWS account? And after previous applies, has anything changed outside of Terraform -- manually, by another tool, or by another team member?
