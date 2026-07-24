@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AWS Infrastructure Scanner + Terraform Comparator
-- Scans EC2, IPs, VPCs, Subnets, Security Groups, Route Tables, IGWs
+- Scans EC2, IPs, VPCs, Subnets, Security Groups, Route Tables, IGWs, S3, RDS, DynamoDB
 - Exports to JSON, Excel, and terminal table
 - Compares against terraform plan output (plan.json) for pre-deploy checks
 - Compares against terraform.tfstate for drift detection
@@ -217,6 +217,111 @@ def scan_igws(ec2):
     return igws
 
 
+def scan_s3(session):
+    s3 = session.client("s3")
+    buckets = []
+    for b in s3.list_buckets()["Buckets"]:
+        name = b.get("Name", "")
+        created = str(b.get("CreationDate", ""))
+        region = "us-east-1"
+        try:
+            region = s3.get_bucket_location(Bucket=name)["LocationConstraint"] or "us-east-1"
+        except Exception:
+            pass
+        versioning = "Enabled"
+        encryption = "Enabled"
+        logging = "Disabled"
+        try:
+            vr = s3.get_bucket_versioning(Bucket=name)
+            versioning = vr.get("Status", "Suspended")
+        except Exception:
+            pass
+        try:
+            s3.get_bucket_encryption(Bucket=name)
+        except Exception:
+            encryption = "Disabled"
+        try:
+            lg = s3.get_bucket_logging(Bucket=name)
+            logging = "Enabled" if lg.get("LoggingEnabled") else "Disabled"
+        except Exception:
+            pass
+        tags = {}
+        try:
+            tag_resp = s3.get_bucket_tagging(Bucket=name)
+            tags = {t["Key"]: t["Value"] for t in tag_resp.get("TagSet", [])}
+        except Exception:
+            pass
+        buckets.append({
+            "resource_type": "s3_bucket",
+            "bucket_name": name,
+            "creation_date": created,
+            "region": region,
+            "versioning": versioning,
+            "encryption": encryption,
+            "logging": logging,
+            "tags": "; ".join(f"{k}={v}" for k, v in tags.items()),
+        })
+    return buckets
+
+
+def scan_rds(session):
+    rds = session.client("rds")
+    instances = []
+    paginator = rds.get_paginator("describe_db_instances")
+    for page in paginator.paginate():
+        for db in page["DBInstances"]:
+            instances.append({
+                "resource_type": "rds_instance",
+                "db_instance_id": db.get("DBInstanceIdentifier", ""),
+                "engine": db.get("Engine", ""),
+                "engine_version": db.get("EngineVersion", ""),
+                "status": db.get("DBInstanceStatus", ""),
+                "class": db.get("DBInstanceClass", ""),
+                "storage_gb": db.get("AllocatedStorage", 0),
+                "multi_az": db.get("MultiAZ", False),
+                "vpc_id": (db.get("DBSubnetGroup") or {}).get("VpcId", ""),
+                "subnet_group": (db.get("DBSubnetGroup") or {}).get("DBSubnetGroupName", ""),
+                "publicly_accessible": db.get("PubliclyAccessible", False),
+                "backup_retention": db.get("BackupRetentionPeriod", 0),
+                "arn": db.get("DBInstanceArn", ""),
+            })
+    return instances
+
+
+def scan_dynamodb(session):
+    dynamodb = session.client("dynamodb")
+    tables = []
+    paginator = dynamodb.get_paginator("list_tables")
+    for page in paginator.paginate():
+        for table_name in page.get("TableNames", []):
+            desc = dynamodb.describe_table(TableName=table_name)["Table"]
+            status = desc.get("TableStatus", "")
+            key_schema = ", ".join(
+                f"{k['AttributeName']}({k['KeyType']})" for k in desc.get("KeySchema", [])
+            )
+            size = desc.get("TableSizeBytes", 0)
+            items = desc.get("ItemCount", 0)
+            stream = desc.get("LatestStreamLabel", "")
+            tags = {}
+            try:
+                tag_resp = dynamodb.list_tags_of_resource(ResourceArn=desc.get("TableArn", ""))
+                tags = {t["Key"]: t["Value"] for t in tag_resp.get("Tags", [])}
+            except Exception:
+                pass
+            tables.append({
+                "resource_type": "dynamodb_table",
+                "table_name": table_name,
+                "status": status,
+                "key_schema": key_schema,
+                "size_bytes": size,
+                "item_count": items,
+                "stream_enabled": bool(stream),
+                "arn": desc.get("TableArn", ""),
+                "tags": "; ".join(f"{k}={v}" for k, v in tags.items()),
+            })
+    return tables
+
+
 def scan_all(region=None, profile=None):
     session_kwargs = {}
     if region:
@@ -237,6 +342,9 @@ def scan_all(region=None, profile=None):
         "security_groups": scan_security_groups(ec2),
         "route_tables": scan_route_tables(ec2),
         "internet_gateways": scan_igws(ec2),
+        "s3_buckets": scan_s3(session),
+        "rds_instances": scan_rds(session),
+        "dynamodb_tables": scan_dynamodb(session),
     }
     totals = {k: len(v) for k, v in data.items() if isinstance(v, list)}
     print(f"{C.GREEN}✓ Scan complete:{C.END} " +
@@ -275,6 +383,12 @@ def print_terminal(data):
         ["route_table_id","name","vpc_id","associations"])
     print_table("Internet Gateways", data["igws"] if "igws" in data else data.get("internet_gateways",[]),
         ["igw_id","name","attached_vpcs","state"])
+    print_table("S3 Buckets", data["s3_buckets"],
+        ["bucket_name","creation_date","versioning","encryption","logging","tags"])
+    print_table("RDS Instances", data["rds_instances"],
+        ["db_instance_id","engine","engine_version","status","class","storage_gb","multi_az","vpc_id","publicly_accessible"])
+    print_table("DynamoDB Tables", data["dynamodb_tables"],
+        ["table_name","status","key_schema","size_bytes","item_count","stream_enabled","tags"])
 
 # ── Excel export ──────────────────────────────────────────────────────────────
 
@@ -364,6 +478,9 @@ def add_summary_sheet(wb, data):
         "security_groups":  ("Security Groups",      "SecurityGroups"),
         "route_tables":     ("Route Tables",         "RouteTables"),
         "internet_gateways":("Internet Gateways",    "IGWs"),
+        "s3_buckets":       ("S3 Buckets",           "S3"),
+        "rds_instances":    ("RDS Instances",        "RDS"),
+        "dynamodb_tables":  ("DynamoDB Tables",      "DynamoDB"),
     }
     start_row = 5
     for ci, h in enumerate(headers, 1):
@@ -410,38 +527,261 @@ def export_excel(data, path):
         ["route_table_id","name","vpc_id","routes","associations","tags"])
     add_sheet(wb, "IGWs", data["internet_gateways"],
         ["igw_id","name","attached_vpcs","state","tags"])
+    add_sheet(wb, "S3", data["s3_buckets"],
+        ["bucket_name","creation_date","region","versioning","encryption","logging","tags"])
+    add_sheet(wb, "RDS", data["rds_instances"],
+        ["db_instance_id","engine","engine_version","status","class","storage_gb","multi_az","vpc_id","subnet_group","publicly_accessible","backup_retention","arn"])
+    add_sheet(wb, "DynamoDB", data["dynamodb_tables"],
+        ["table_name","status","key_schema","size_bytes","item_count","stream_enabled","arn","tags"])
 
     wb.save(path)
     print(f"{C.GREEN}✓ Excel exported:{C.END} {path}")
 
+# ── Mermaid export ────────────────────────────────────────────────────────────
+
+def _mid(s):
+    """Sanitise a string for use as a Mermaid node ID."""
+    return s.replace("-", "_").replace(".", "_").replace("/", "_").replace(":", "_")
+
+
+def generate_mermaid_topology(data):
+    lines = ["graph TB", ""]
+    node_defs = []
+    edges = []
+
+    vpc_subnets = {}
+    for s in data.get("subnets", []):
+        vpc_subnets.setdefault(s["vpc_id"], []).append(s)
+
+    for vpc in data.get("vpcs", []):
+        vid = _mid(vpc["vpc_id"])
+        label = vpc.get("name") or vpc["vpc_id"]
+        cidr = vpc.get("cidr_block", "")
+        lines.append(f'  subgraph {vid}["{label} ({cidr})"]')
+        for s in vpc_subnets.get(vpc["vpc_id"], []):
+            sid = _mid(s["subnet_id"])
+            sname = s.get("name") or s["subnet_id"]
+            scidr = s.get("cidr_block", "")
+            az = s.get("availability_zone", "")
+            pub = "public" if s.get("map_public_ip") else "private"
+            lines.append(f'    {sid}["{sname}<br/>{scidr}<br/>{az} ({pub})"]')
+        lines.append("  end")
+
+    for inst in data.get("ec2_instances", []):
+        iid = _mid(inst["instance_id"])
+        iname = inst.get("name") or inst["instance_id"]
+        itype = inst.get("instance_type", "")
+        node_defs.append(f'  {iid}["{iname}<br/>{inst["instance_id"]}<br/>{itype}"]')
+        if inst.get("subnet_id"):
+            edges.append(f"  {_mid(inst['subnet_id'])} --> {iid}")
+
+    for igw in data.get("internet_gateways", []):
+        gid = _mid(igw["igw_id"])
+        gname = igw.get("name") or igw["igw_id"]
+        node_defs.append(f'  {gid}["{gname}<br/>{igw["igw_id"]}"]')
+        for vpc_id in igw.get("attached_vpcs", "").split(";"):
+            vpc_id = vpc_id.strip()
+            if vpc_id:
+                edges.append(f"  {gid} --> {_mid(vpc_id)}")
+
+    lines.extend(node_defs)
+    lines.append("")
+    lines.extend(edges)
+    return "\n".join(lines) + "\n"
+
+
+def generate_mermaid_security_groups(data):
+    lines = ["graph LR", ""]
+    node_defs = []
+    edges = []
+
+    sg_map = {sg["group_id"]: sg for sg in data.get("security_groups", [])}
+
+    for sg in data.get("security_groups", []):
+        sid = _mid(sg["group_id"])
+        sname = sg.get("group_name") or sg["group_id"]
+        node_defs.append(f'  {sid}["{sname}<br/>{sg["group_id"]}"]')
+
+        for rule_str in sg.get("inbound_rules", "").split(";"):
+            rule_str = rule_str.strip()
+            if not rule_str:
+                continue
+            if "→" in rule_str:
+                targets = rule_str.split("→", 1)[1].strip()
+                for t in targets.split(","):
+                    t = t.strip()
+                    if t.startswith("sg-") and t in sg_map and t != sg["group_id"]:
+                        tid = _mid(t)
+                        edges.append(f'  {tid} -->|"inbound"| {sid}')
+
+    for inst in data.get("ec2_instances", []):
+        iid = _mid(inst["instance_id"])
+        iname = inst.get("name") or inst["instance_id"]
+        node_defs.append(f'  {iid}["{iname}<br/>{inst["instance_id"]}"]')
+        for sg_id in inst.get("security_groups", "").split(";"):
+            sg_id = sg_id.strip()
+            if sg_id and sg_id in sg_map:
+                edges.append(f'  {iid} --> {_mid(sg_id)}')
+
+    seen = set()
+    unique_nodes = []
+    for n in node_defs:
+        nid = n.split("[")[0].strip()
+        if nid not in seen:
+            seen.add(nid)
+            unique_nodes.append(n)
+
+    lines.extend(unique_nodes)
+    lines.append("")
+    lines.extend(edges)
+    return "\n".join(lines) + "\n"
+
+
+def generate_mermaid_routing(data):
+    lines = ["graph TB", ""]
+    node_defs = []
+    edges = []
+
+    igw_ids = {igw["igw_id"] for igw in data.get("internet_gateways", [])}
+
+    for rt in data.get("route_tables", []):
+        rtid = _mid(rt["route_table_id"])
+        rtname = rt.get("name") or rt["route_table_id"]
+        assoc = rt.get("associations", "")
+        node_defs.append(f'  {rtid}["{rtname}<br/>{rt["route_table_id"]}<br/>assoc: {assoc}"]')
+
+        for route_str in rt.get("routes", "").split(";"):
+            route_str = route_str.strip()
+            if not route_str:
+                continue
+            if "→" in route_str:
+                dest, rest = route_str.split("→", 1)
+                target = rest.split("(")[0].strip()
+                if target == "local":
+                    tid = f"local_{_mid(rt['vpc_id'])}"
+                    node_defs.append(f'  {tid}["local<br/>{rt.get("vpc_id", "")}"]')
+                    edges.append(f'  {rtid} -->|"dest: {dest}"| {tid}')
+                elif target.startswith("igw-"):
+                    tid = _mid(target)
+                    edges.append(f'  {rtid} -->|"dest: {dest}"| {tid}')
+                elif target.startswith("nat-"):
+                    tid = _mid(target)
+                    node_defs.append(f'  {tid}["{target}<br/>NAT Gateway"]')
+                    edges.append(f'  {rtid} -->|"dest: {dest}"| {tid}')
+                elif target.startswith("vpce-"):
+                    tid = _mid(target)
+                    node_defs.append(f'  {tid}["{target}<br/>VPC Endpoint"]')
+                    edges.append(f'  {rtid} -->|"dest: {dest}"| {tid}')
+                else:
+                    tid = _mid(target)
+                    node_defs.append(f'  {tid}["{target}"]')
+                    edges.append(f'  {rtid} -->|"dest: {dest}"| {tid}')
+
+    for igw in data.get("internet_gateways", []):
+        gid = _mid(igw["igw_id"])
+        gname = igw.get("name") or igw["igw_id"]
+        node_defs.append(f'  {gid}["{gname}<br/>{igw["igw_id"]}"]')
+
+    seen = set()
+    unique_nodes = []
+    for n in node_defs:
+        nid = n.split("[")[0].strip()
+        if nid not in seen:
+            seen.add(nid)
+            unique_nodes.append(n)
+
+    lines.extend(unique_nodes)
+    lines.append("")
+    lines.extend(edges)
+    return "\n".join(lines) + "\n"
+
+
+def export_mermaid(data, out_dir, ts):
+    diagrams = {
+        "vpc_topology":       generate_mermaid_topology,
+        "security_groups":    generate_mermaid_security_groups,
+        "routing":            generate_mermaid_routing,
+    }
+    for name, fn in diagrams.items():
+        path = out_dir / f"aws_scan_{ts}_{name}.mmd"
+        with open(path, "w") as f:
+            f.write(fn(data))
+        print(f"{C.GREEN}✓ Mermaid exported:{C.END} {path}")
+
 # ── Terraform comparison ──────────────────────────────────────────────────────
 
+_SAFE_PLAN_FIELDS = {
+    "aws_instance":          ["id", "instance_type", "subnet_id", "vpc_security_group_ids"],
+    "aws_eip":               ["id"],
+    "aws_vpc":               ["id", "cidr_block"],
+    "aws_subnet":            ["id", "cidr_block"],
+    "aws_security_group":    ["id"],
+    "aws_route_table":       ["id"],
+    "aws_internet_gateway":  ["id"],
+    "aws_s3_bucket":         ["id", "bucket"],
+    "aws_db_instance":       ["id", "db_instance_identifier", "engine", "engine_version", "instance_class", "allocated_storage"],
+    "aws_dynamodb_table":    ["id", "name"],
+}
+
 def extract_tf_plan_resources(plan_path):
-    """Parse `terraform show -json tfplan` output."""
+    """Parse `terraform show -json tfplan` output — only keeps fields needed for comparison."""
     with open(plan_path) as f:
         plan = json.load(f)
 
     resources = []
     changes = plan.get("resource_changes", [])
     for rc in changes:
+        rtype = rc.get("type", "")
+        if rtype not in _SAFE_PLAN_FIELDS:
+            continue
         action = rc.get("change", {}).get("actions", [])
         after  = rc.get("change", {}).get("after") or {}
         before = rc.get("change", {}).get("before") or {}
+        safe_fields = _SAFE_PLAN_FIELDS[rtype]
         resources.append({
             "address":       rc.get("address", ""),
-            "type":          rc.get("type", ""),
+            "type":          rtype,
             "name":          rc.get("name", ""),
             "action":        "+".join(action),
             "id_after":      after.get("id", ""),
             "id_before":     before.get("id", ""),
-            "after":         after,
-            "before":        before,
+            "after":         {k: after.get(k) for k in safe_fields},
+            "before":        {k: before.get(k) for k in safe_fields},
         })
     return resources
 
 
+_SAFE_STATE_FIELDS = {
+    "aws_instance":          ["id", "instance_type", "instance_state"],
+    "aws_eip":               ["id", "allocation_id", "public_ip"],
+    "aws_vpc":               ["id", "cidr_block"],
+    "aws_subnet":            ["id", "cidr_block"],
+    "aws_security_group":    ["id", "name", "description"],
+    "aws_route_table":       ["id"],
+    "aws_internet_gateway":  ["id"],
+    "aws_s3_bucket":         ["id", "bucket"],
+    "aws_db_instance":       ["id", "db_instance_identifier", "engine", "engine_version", "instance_class", "allocated_storage"],
+    "aws_dynamodb_table":    ["id", "name"],
+}
+
+def _filter_sensitive(attrs, safe_fields):
+    """Return only safe_fields from attrs, skipping anything marked sensitive."""
+    filtered = {}
+    for key in safe_fields:
+        val = attrs.get(key)
+        if val is None:
+            continue
+        # Terraform marks sensitive values with a parallel "key": {"sensitive": true}
+        # In state JSON, sensitive attributes appear as nested dicts in the
+        # "sensitive_values" top-level key, or have a sibling with the same name
+        # in the "sensitive_attributes" list.  We skip any key that is present
+        # in the state's sensitive_values map.
+        filtered[key] = val
+    return filtered
+
+
 def extract_tf_state_resources(state_path):
-    """Parse terraform.tfstate."""
+    """Parse terraform.tfstate — only keeps fields needed for drift detection."""
     with open(state_path) as f:
         state = json.load(f)
 
@@ -449,14 +789,21 @@ def extract_tf_state_resources(state_path):
     for module in state.get("resources", []):
         rtype = module.get("type", "")
         rname = module.get("name", "")
+        safe_fields = _SAFE_STATE_FIELDS.get(rtype)
+        if safe_fields is None:
+            continue  # skip resource types we don't compare
+
         for inst in module.get("instances", []):
             attrs = inst.get("attributes", {})
+            sensitive = inst.get("sensitive_values", {})
+            safe = {k: v for k, v in _filter_sensitive(attrs, safe_fields).items()
+                    if k not in sensitive}
             resources.append({
                 "address": f"{rtype}.{rname}",
                 "type":    rtype,
                 "name":    rname,
                 "id":      attrs.get("id", ""),
-                "attrs":   attrs,
+                "attrs":   safe,
             })
     return resources
 
@@ -470,6 +817,9 @@ TF_TO_SCAN_MAP = {
     "aws_security_group":        ("security_groups",    "group_id"),
     "aws_route_table":           ("route_tables",       "route_table_id"),
     "aws_internet_gateway":      ("internet_gateways",  "igw_id"),
+    "aws_s3_bucket":             ("s3_buckets",         "bucket_name"),
+    "aws_db_instance":           ("rds_instances",      "db_instance_id"),
+    "aws_dynamodb_table":        ("dynamodb_tables",    "table_name"),
 }
 
 
@@ -619,6 +969,29 @@ def compare_state(data, state_path):
                 if tf_cidr and live_cidr and tf_cidr != live_cidr:
                     drifts.append(f"cidr_block: TF={tf_cidr} AWS={live_cidr}")
 
+            # RDS drift
+            if rtype == "aws_db_instance":
+                tf_class = r["attrs"].get("instance_class", "")
+                live_class = live.get("class", "")
+                if tf_class and live_class and tf_class != live_class:
+                    drifts.append(f"instance_class: TF={tf_class} AWS={live_class}")
+                tf_engine = r["attrs"].get("engine_version", "")
+                live_engine = live.get("engine_version", "")
+                if tf_engine and live_engine and tf_engine != live_engine:
+                    drifts.append(f"engine_version: TF={tf_engine} AWS={live_engine}")
+                tf_storage = r["attrs"].get("allocated_storage", "")
+                live_storage = live.get("storage_gb", "")
+                if tf_storage and live_storage and str(tf_storage) != str(live_storage):
+                    drifts.append(f"allocated_storage: TF={tf_storage} AWS={live_storage}")
+
+            # DynamoDB drift
+            if rtype == "aws_dynamodb_table":
+                pass  # DynamoDB has limited comparable attributes; existence check is primary
+
+            # S3 drift (existence check only — no attributes to compare)
+            if rtype == "aws_s3_bucket":
+                pass
+
             if drifts:
                 finding["status"] = "DRIFT"
                 finding["detail"] = " | ".join(drifts)
@@ -736,6 +1109,7 @@ Examples:
     parser.add_argument("--no-terminal",action="store_true", help="Skip terminal table output")
     parser.add_argument("--no-excel",   action="store_true", help="Skip Excel export")
     parser.add_argument("--no-json",    action="store_true", help="Skip JSON export")
+    parser.add_argument("--no-mermaid", action="store_true", help="Skip Mermaid diagram export")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -756,7 +1130,11 @@ Examples:
             json.dump(data, f, indent=2, default=str)
         print(f"{C.GREEN}✓ JSON exported:{C.END} {json_path}")
 
-    # 4. Terraform comparisons
+    # 4. Mermaid diagrams
+    if not args.no_mermaid:
+        export_mermaid(data, out_dir, ts)
+
+    # 5. Terraform comparisons
     plan_findings  = []
     state_findings = []
 
@@ -766,7 +1144,7 @@ Examples:
     if args.state:
         state_findings = compare_state(data, args.state)
 
-    # 5. Excel export (includes comparison sheets if run)
+    # 6. Excel export (includes comparison sheets if run)
     if not args.no_excel and XLSX_AVAILABLE:
         xlsx_path = out_dir / f"aws_scan_{ts}.xlsx"
         wb = openpyxl.Workbook()
@@ -789,6 +1167,12 @@ Examples:
             ["route_table_id","name","vpc_id","routes","associations","tags"])
         add_sheet(wb, "IGWs", data["internet_gateways"],
             ["igw_id","name","attached_vpcs","state","tags"])
+        add_sheet(wb, "S3", data["s3_buckets"],
+            ["bucket_name","creation_date","region","versioning","encryption","logging","tags"])
+        add_sheet(wb, "RDS", data["rds_instances"],
+            ["db_instance_id","engine","engine_version","status","class","storage_gb","multi_az","vpc_id","subnet_group","publicly_accessible","backup_retention","arn"])
+        add_sheet(wb, "DynamoDB", data["dynamodb_tables"],
+            ["table_name","status","key_schema","size_bytes","item_count","stream_enabled","arn","tags"])
 
         if plan_findings:
             export_comparison_sheet(wb, plan_findings, "PreDeploy_Check", "plan")
